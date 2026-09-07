@@ -6,9 +6,9 @@ import asyncio
 import hashlib
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
+from dotenv import load_dotenv
 
 from playwright_stealth import Stealth
-
 from fastapi import FastAPI, HTTPException, Depends, Request, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
@@ -19,27 +19,48 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 # CONFIGURATION & CONSTANTS
 # ==============================================================================
 TARGET_URL = "https://gemini.rakyatdigital.gov.my"
-API_KEY = os.getenv("API_KEY", "api_key")  # Change this or set API_KEY env variable
 AVAILABLE_MODELS = ["Auto"]
 
 DATA_DIR = Path.home() / ".gemini-service"
 PROFILE_DIR = DATA_DIR / "chrome-profile"
 LOGIN_FLAG = DATA_DIR / "logged-in"
+BASE_DIR = Path(__file__).resolve().parent
+PROPERTIES_FILE = BASE_DIR / "config.properties"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+load_dotenv(dotenv_path=PROPERTIES_FILE, override=True)
+
+API_KEY = os.getenv("API_KEY")
+
+if not API_KEY:
+  print(
+      "⚠️ WARNING: API_KEY is not set or config.properties is missing! Running"
+      " without authentication."
+  )
+else:
+  print("🔒 API Key protection enabled from config.properties.")
+
 app = FastAPI(title="Gemini Enterprise Local Gateway")
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+    
+def verify_api_key(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+):
+  if not API_KEY:
+    return True
 
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return credentials.credentials
+  if not credentials or not secrets.compare_digest(
+      credentials.credentials, API_KEY
+  ):
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or missing authentication credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+  return credentials.credentials
 
 playwright_instance = None
 context: Optional[BrowserContext] = None
@@ -240,158 +261,45 @@ def get_session_id(req: ChatRequest, request: Request) -> str:
     return f"chat-{digest}"
 
 def format_tools_prompt(tools: List[Tool]) -> str:
-    """Format tools into a clear prompt for Gemini"""
+    """Format tools cleanly using the exact tool names and parameters provided by the harness."""
     if not tools:
         return ""
-    
-    prompt = """## TOOL CALLING SYSTEM
 
-═══════════════════════════════════════════════════════════════════════════════
-                    🚨🚨🚨 YOU ARE A TOOL-EXECUTING AI 🚨🚨🚨
-═══════════════════════════════════════════════════════════════════════════════
+    lines = [
+        "## MANDATORY TOOL CALLING SYSTEM",
+        "You have access to the local environment and filesystem through the tools defined below.",
+        "When the user asks you to read, write, create, edit files, or execute commands, you MUST call the appropriate tool.",
+        "",
+        "### OUTPUT FORMAT RULES:",
+        "To execute a tool call, output ONLY valid JSON inside <tool_call> tags:",
+        "<tool_call>",
+        '{"name": "tool_name", "arguments": {"param_key": "param_value"}}',
+        "</tool_call>",
+        "",
+        "- You may output a brief explanation to the user before or after the <tool_call> tag.",
+        "- Do NOT wrap <tool_call> in markdown code blocks.",
+        "- Call only ONE tool at a time, then stop and wait for the tool output.",
+        "",
+        "### DEFINITIONS OF AVAILABLE TOOLS:"
+    ]
 
-YOU HAVE FULL ACCESS TO THE USER'S COMPUTER THROUGH TOOLS.
-YOU CAN READ, WRITE, EDIT, LIST, SEARCH, AND EXECUTE ANYTHING.
-
-NEVER SAY:
-❌ "I don't have access to..."
-❌ "I can only see files in..."
-❌ "I cannot access your computer..."
-❌ "Would you like me to... instead?"
-
-YOU MUST:
-✅ USE THE TOOLS PROVIDED
-✅ EXECUTE WHAT THE USER ASKS
-✅ NEVER REFUSE OR MAKE EXCUSES
-
-If user asks to list Desktop → USE list tool on /Users/macbookair/Desktop
-If user asks to read a file → USE read tool
-If user asks to edit → USE edit tool
-JUST DO IT. NO EXCUSES.
-
-═══════════════════════════════════════════════════════════════════════════════
-                    🚨 WRITE vs EDIT - ABSOLUTE RULE 🚨
-═══════════════════════════════════════════════════════════════════════════════
-
-WRITE TOOL IS PROHIBITED FOR EXISTING FILES!
-
-• File already exists? → YOU MUST USE EDIT TOOL. WRITE IS FORBIDDEN.
-• User says "update", "change", "modify", "fix", "edit", "improve", "enhance" → EDIT TOOL ONLY
-• WRITE tool is ONLY for creating brand new files that don't exist yet
-
-═══════════════════════════════════════════════════════════════════════════════
-                    ⛔ NEVER PUT CODE DIRECTLY IN JSON ⛔
-═══════════════════════════════════════════════════════════════════════════════
-
-ALL code/content must be in markdown code blocks with placeholders:
-- WRITE: USE_CODE_BLOCK_ABOVE
-- EDIT: USE_OLD_CODE_ABOVE and USE_NEW_CODE_ABOVE
-
-═══════════════════════════════════════════════════════════════════════════════
-                    🔴🔴🔴 EDIT TOOL - CRITICAL FORMAT 🔴🔴🔴
-═══════════════════════════════════════════════════════════════════════════════
-
-THE EDIT TOOL HAS A VERY SPECIFIC FORMAT. FOLLOW IT EXACTLY OR IT WILL FAIL.
-
-STEP 1: Write the OLD code (code to find) in a markdown code block
-STEP 2: Write the NEW code (replacement) in a SECOND markdown code block  
-STEP 3: Write the JSON with PLACEHOLDERS (not actual code!)
-
-✅ CORRECT EDIT FORMAT:
-
-Old code to replace:
-```html
-<section id="about">Old content here</section>
-```
-
-New replacement:
-```html
-<section id="skills">New content here</section>
-<section id="about">Old content here</section>
-```
-
-{"tool_calls": [{"name": "edit", "arguments": {"filePath": "/path/file.html", "oldString": "USE_OLD_CODE_ABOVE", "newString": "USE_NEW_CODE_ABOVE"}}]}
-
-❌ WRONG - NEVER DO THIS:
-{"tool_calls": [{"name": "edit", "arguments": {"filePath": "/path.html", "oldString": "<actual code here>", "newString": "<actual code here>"}}]}
-
-❌ WRONG - NEVER PUT USE_OLD_CODE_ABOVE INSIDE newString:
-{"tool_calls": [{"name": "edit", "arguments": {"newString": "USE_OLD_CODE_ABOVE\n<code>"}}]}
-
-THE PLACEHOLDERS ARE LITERAL STRINGS:
-- oldString MUST be exactly: "USE_OLD_CODE_ABOVE"
-- newString MUST be exactly: "USE_NEW_CODE_ABOVE"
-
-═══════════════════════════════════════════════════════════════════════════════
-                         📁 OTHER FILE OPERATIONS
-═══════════════════════════════════════════════════════════════════════════════
-
-READ FILE:
-{"tool_calls": [{"name": "read", "arguments": {"filePath": "/path/file.txt"}}]}
-
-WRITE NEW FILE (ONLY for files that DON'T EXIST):
-```html
-<!DOCTYPE html>
-<html><body>Content</body></html>
-```
-{"tool_calls": [{"name": "write", "arguments": {"filePath": "/new-file.html", "content": "USE_CODE_BLOCK_ABOVE"}}]}
-
-═══════════════════════════════════════════════════════════════════════════════
-                         🔍 SEARCH & NAVIGATION
-═══════════════════════════════════════════════════════════════════════════════
-
-FIND FILES:
-{"tool_calls": [{"name": "glob", "arguments": {"pattern": "**/*.tsx"}}]}
-
-SEARCH CONTENT:
-{"tool_calls": [{"name": "grep", "arguments": {"pattern": "functionName", "path": "/project"}}]}
-
-LIST DIRECTORY:
-{"tool_calls": [{"name": "list", "arguments": {"path": "/directory"}}]}
-
-EXECUTE COMMAND:
-{"tool_calls": [{"name": "execute", "arguments": {"command": "npm test"}}]}
-
-MULTIPLE TOOLS:
-{"tool_calls": [{"name": "read", "arguments": {"filePath": "/a.js"}}, {"name": "read", "arguments": {"filePath": "/b.js"}}]}
-
-═══════════════════════════════════════════════════════════════════════════════
-                         ⛔ FORBIDDEN ⛔
-═══════════════════════════════════════════════════════════════════════════════
-
-❌ Refusing to use tools or making excuses
-❌ WRITE tool on existing file (USE EDIT!)
-❌ Code directly in JSON (use code blocks + placeholders)
-❌ YAML format
-❌ JSON in code blocks
-
-═══════════════════════════════════════════════════════════════════════════════
-                         AVAILABLE TOOLS
-═══════════════════════════════════════════════════════════════════════════════
-
-"""
     for tool in tools:
         func = tool.function
-        prompt += f"▸ {func.name}"
+        lines.append(f"\n- Tool Name: {func.name}")
         if func.description:
-            prompt += f" - {func.description}"
-        prompt += "\n"
-        
-        if func.parameters and func.parameters.get('properties'):
-            props = func.parameters['properties']
-            required = func.parameters.get('required', [])
+            lines.append(f"  Description: {func.description}")
+        if func.parameters and func.parameters.get("properties"):
+            props = func.parameters["properties"]
+            required = func.parameters.get("required", [])
+            lines.append("  Arguments:")
             for pname, pinfo in props.items():
-                req = " ⚠REQUIRED" if pname in required else ""
-                ptype = pinfo.get('type', '')
-                desc = pinfo.get('description', '')
-                prompt += f"    {pname} ({ptype}){req}: {desc}\n"
-        prompt += "\n"
-    
-    prompt += """═══════════════════════════════════════════════════════════════════════════════
-REMEMBER: YOU HAVE FULL SYSTEM ACCESS. USE THE TOOLS. NEVER REFUSE.
-═══════════════════════════════════════════════════════════════════════════════
-"""
-    return prompt
+                req_str = " (REQUIRED)" if pname in required else " (optional)"
+                ptype = pinfo.get("type", "string")
+                desc = pinfo.get("description", "")
+                lines.append(f"    * {pname}{req_str} [{ptype}]: {desc}")
+
+    lines.append("\nCRITICAL: Never output placeholders like USE_CODE_BLOCK_ABOVE. Always supply the full parameters inside the JSON arguments.")
+    return "\n".join(lines)
 
 
 def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = None) -> str:
@@ -425,71 +333,91 @@ def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = N
     
     return "\n\n".join(formatted)
 
-def parse_tool_calls(response: str) -> Optional[List[Dict]]:
-    """Extract tool calls from response - handles multiple formats robustly"""
+def parse_tool_calls(response: str) -> tuple[str, Optional[List[Dict]]]:
+    """
+    Extracts tool calls from the response text and resolves code placeholders.
+    Returns: (cleaned_content_text, list_of_openai_tool_calls)
+    """
+    if not response:
+        return "", None
+
     cleaned = response.replace('\\_', '_')
+    raw_tools = []
     
-    # Method 1: Standard JSON with "tool_calls": [...]
-    start = cleaned.find('"tool_calls"')
-    if start != -1:
-        arr_start = cleaned.find('[', start)
-        if arr_start != -1:
-            depth = 0
-            for i, c in enumerate(cleaned[arr_start:], arr_start):
-                if c == '[':
-                    depth += 1
-                elif c == ']':
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(cleaned[arr_start:i+1])
-                        except:
-                            break
-    
-    # Method 2: YAML-style "tool_calls:" - parse manually
-    if 'tool_calls:' in cleaned:
-        try:
-            lines = cleaned.split('\n')
-            tools = []
-            current_tool = None
-            in_args = False
-            
-            for line in lines:
-                stripped = line.strip()
-                if stripped.startswith('- name:'):
-                    if current_tool:
-                        tools.append(current_tool)
-                    current_tool = {"name": stripped.split(':', 1)[1].strip(), "arguments": {}}
-                    in_args = False
-                elif stripped == 'arguments:' and current_tool:
-                    in_args = True
-                elif in_args and current_tool and ':' in stripped and not stripped.startswith('-'):
-                    key, val = stripped.split(':', 1)
-                    current_tool["arguments"][key.strip()] = val.strip()
-            
-            if current_tool:
-                tools.append(current_tool)
-            
-            if tools:
-                return tools
-        except:
-            pass
-    
-    # Method 3: Find any JSON object with "name" and "arguments"
-    pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^\{\}]*\})'
-    matches = re.findall(pattern, cleaned)
-    if matches:
-        tools = []
-        for name, args_str in matches:
+    # 1. Check for Nous/Hermes/Gemini XML-style: <tool_call> ... </tool_call>
+    xml_matches = re.findall(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', cleaned, re.DOTALL)
+    if xml_matches:
+        for match in xml_matches:
             try:
-                args = json.loads(args_str)
-            except:
+                raw_tools.append(json.loads(match))
+            except Exception:
+                pass
+        # Strip the tool call XML tags from user-facing content
+        cleaned = re.sub(r'<tool_call>\s*\{.*?\}\s*</tool_call>', '', cleaned, flags=re.DOTALL).strip()
+
+    # 2. Check for standard JSON {"tool_calls": [...]}
+    if not raw_tools:
+        start = cleaned.find('"tool_calls"')
+        if start != -1:
+            arr_start = cleaned.find('[', start)
+            if arr_start != -1:
+                depth = 0
+                for i, c in enumerate(cleaned[arr_start:], arr_start):
+                    if c == '[': depth += 1
+                    elif c == ']':
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                raw_tools = json.loads(cleaned[arr_start:i+1])
+                            except Exception:
+                                pass
+                            break
+
+    # 3. Check for single object pattern: {"name": ..., "arguments": ...}
+    if not raw_tools:
+        pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^\{\}]*\})'
+        for name, args_str in re.findall(pattern, cleaned):
+            try:
+                raw_tools.append({"name": name, "arguments": json.loads(args_str)})
+            except Exception:
+                pass
+
+    if not raw_tools:
+        return cleaned, None
+
+    # Extract all markdown code blocks to resolve placeholders (USE_CODE_BLOCK_ABOVE, etc.)
+    code_blocks = re.findall(r'```(?:\w+)?\n([\s\S]*?)```', response)
+
+    formatted_tool_calls = []
+    for idx, tc in enumerate(raw_tools):
+        name = tc.get("name")
+        args = tc.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
                 args = {}
-            tools.append({"name": name, "arguments": args})
-        if tools:
-            return tools
-    
-    return None
+
+        # Resolve prompt placeholders if Gemini used code blocks
+        if code_blocks:
+            if args.get("content") == "USE_CODE_BLOCK_ABOVE" and len(code_blocks) >= 1:
+                args["content"] = code_blocks[-1]
+            if args.get("oldString") == "USE_OLD_CODE_ABOVE" and len(code_blocks) >= 2:
+                args["oldString"] = code_blocks[-2]
+                args["newString"] = code_blocks[-1]
+            elif args.get("newString") == "USE_NEW_CODE_ABOVE" and len(code_blocks) >= 1:
+                args["newString"] = code_blocks[-1]
+
+        formatted_tool_calls.append({
+            "id": f"call_{int(time.time())}_{idx}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False)
+            }
+        })
+
+    return cleaned, formatted_tool_calls
 
 # ==============================================================================
 # BROWSER & SESSION MANAGEMENT
@@ -855,13 +783,19 @@ async def send_to_gemini(page: Page, text: str, model: str = None, timeout: int 
         
     return response_text
     
-async def stream_from_gemini(session_id: str, page: Page, text: str, model: str = None, timeout: int = 180):
-    """Yield an OpenAI-compatible SSE stream while Gemini is generating."""
+async def stream_from_gemini(
+    session_id: str, 
+    page: Page, 
+    text: str, 
+    model: str = None, 
+    tools: Optional[List[Tool]] = None, 
+    timeout: int = 180
+):
+    """Yield an OpenAI-compatible SSE stream with tool-call detection."""
     completion_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
 
     def event(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
-        """Encode one Chat Completions chunk in the OpenAI SSE format."""
         payload = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -882,34 +816,34 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
         response_selector = '.turn'
         existing_responses = await page.query_selector_all(response_selector)
         response_count_before = len(existing_responses)
-        
+
         try:
             input_box = page.locator('ucs-prosemirror-editor#agent-search-prosemirror-editor, ucs-prosemirror-editor').first
             await input_box.wait_for(state="visible", timeout=10000)
             await input_box.click()
             await asyncio.sleep(0.3)
-            
+
             await page.keyboard.press('Control+A')
             await page.keyboard.press('Meta+A')
             await page.keyboard.press('Backspace')
             await asyncio.sleep(0.1)
-            
+
             await page.evaluate('''([box, txt]) => {
                 box.focus();
                 document.execCommand('insertText', false, txt);
             }''', [await input_box.element_handle(), text])
-            
+
             await asyncio.sleep(0.3)
         except Exception as e:
             print(f"Error targeting chat box: {e}", flush=True)
-            
+
         try:
             send_button = page.locator('.send-button.submit, button[aria-label="Submit"]').first
             await send_button.wait_for(state="visible", timeout=3000)
             await send_button.click()
         except:
             await page.keyboard.press('Enter')
-            
+
         await asyncio.sleep(1)
 
         start_time = time.monotonic()
@@ -925,11 +859,11 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
             try:
                 response_divs = await page.query_selector_all('.turn')
                 current_count = len(response_divs)
-                
+
                 if current_count > response_count_before or (response_count_before == 0 and current_count > 0):
                     last_turn = response_divs[-1]
                     state = await last_turn.evaluate(JS_STATUS_AND_EXTRACTOR)
-                    
+
                     is_generating = state.get("isGenerating", False)
                     has_active_work = state.get("hasActiveWork", False)
                     current_text = clean_response_text(state.get("text", ""))
@@ -948,10 +882,6 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
                     if current_text or is_generating or has_active_work:
                         has_seen_generation_start = True
 
-                    # Browser-rendered enterprise responses can replace the
-                    # provisional plan with the final answer.  Buffer the UI
-                    # snapshots and emit one complete OpenAI content delta only
-                    # after retrieval and rendering have both gone quiet.
                     if (
                         has_seen_generation_start
                         and current_text
@@ -973,24 +903,59 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
                             now - first_content_at >= grace_seconds
                             and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
                         ):
+                            # 1. First event: announce role
                             yield event({"role": "assistant", "content": ""})
-                            yield event({"content": current_text})
-                            yield event({}, "stop")
+
+                            tool_calls = None
+                            clean_text = current_text
+                            if tools:
+                                clean_text, tool_calls = parse_tool_calls(current_text)
+
+                            if tool_calls:
+                                print(f"🔧 [Stream] Emitting tool calls: {[tc['function']['name'] for tc in tool_calls]}", flush=True)
+                                
+                                # If there's conversational commentary before the tool call, stream it first
+                                if clean_text:
+                                    yield event({"content": clean_text})
+
+                                # Stream tool_calls formatted properly with `index` for streaming clients
+                                formatted_stream_tools = []
+                                for idx, tc in enumerate(tool_calls):
+                                    formatted_stream_tools.append({
+                                        "index": idx,
+                                        "id": tc.get("id", f"call_{int(time.time())}_{idx}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["function"]["name"],
+                                            "arguments": tc["function"]["arguments"]
+                                        }
+                                    })
+
+                                yield event({"tool_calls": formatted_stream_tools})
+                                # Final chunk with finish_reason
+                                yield event({}, finish_reason="tool_calls")
+                            else:
+                                if clean_text:
+                                    yield event({"content": clean_text})
+                                yield event({}, finish_reason="stop")
+
                             yield "data: [DONE]\n\n"
-                            break
+                            return
+
             except Exception as e:
-                # Do not hide streaming failures: swallowing them makes the
-                # client appear to hang and obscures the actual extractor issue.
                 print(f"  [Debug] Error polling stream: {e}", flush=True)
 
-            # A standard SSE comment keeps the HTTP response alive while the
-            # enterprise UI is retrieving documents.  It is ignored by clients.
             now = time.monotonic()
             if now - last_keepalive_at >= 10:
                 yield ": keep-alive\n\n"
                 last_keepalive_at = now
 
             await asyncio.sleep(0.5)
+        
+        # Fallback if loop finishes without break
+        yield event({"role": "assistant", "content": "I apologize, the gateway timed out waiting for the web response."})
+        yield event({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
 
 
 # ==============================================================================
@@ -1017,13 +982,66 @@ async def list_models():
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(req: ChatRequest, request: Request):
+    is_title_request = any(
+        "You name chat sessions" in (m.content or "")
+        for m in req.messages
+        if isinstance(m.content, str)
+    )
+  
+    if is_title_request:
+        print("🏷️ [Intercepted] Hermes title generator detected. Returning instant title.", flush=True)
+        title_json = '{"title": "Gemini Session"}'
+
+        if req.stream:
+            async def stream_title():
+                completion_id = f"chatcmpl-title-{int(time.time() * 1000)}"
+                created = int(time.time())
+                
+                # Chunk 1: content
+                chunk1 = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": title_json},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(chunk1)}\n\n"
+
+                # Chunk 2: finish_reason
+                chunk2 = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(chunk2)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_title(), 
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+    
     if not is_ready:
         raise HTTPException(status_code=503, detail="Gateway is initializing or awaiting authentication.")
         
     session_id = get_session_id(req, request)
     page = await get_or_create_session_page(session_id)
     
-    # Generate formatted conversation string combining tools and messages
     conversation = format_conversation(req.messages, req.tools)
     print(
         f"📥 [{time.strftime('%H:%M:%S')}] Chat {session_id[-8:]}: "
@@ -1031,11 +1049,10 @@ async def chat_completions(req: ChatRequest, request: Request):
         flush=True,
     )
 
-    # 1. STREAMING MODE (Prevents Hermes Timeout)
+    # 1. STREAMING MODE
     if req.stream:
-        # Pass session_id to the generator so it can lock the page while streaming
         return StreamingResponse(
-            stream_from_gemini(session_id, page, conversation, model=req.model),
+            stream_from_gemini(session_id, page, conversation, model=req.model, tools=req.tools),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1044,36 +1061,26 @@ async def chat_completions(req: ChatRequest, request: Request):
             },
         )
 
-    # 2. NORMAL/BLOCKING MODE (Includes your Tool Calling logic)
+    # 2. NON-STREAMING MODE
     async with page_locks[session_id]:
         ai_reply = await send_to_gemini(page, conversation, model=req.model)
         
         tool_calls = None
         finish_reason = "stop"
+        clean_text = ai_reply
         
-        # If tools were provided, attempt to extract them from the response
         if req.tools:
-            parsed_tools = parse_tool_calls(ai_reply)
-            if parsed_tools:
-                tool_calls = []
-                for i, tc in enumerate(parsed_tools):
-                    tool_calls.append({
-                        "id": f"call_{int(time.time())}_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name"),
-                            "arguments": json.dumps(tc.get("arguments", {}))
-                        }
-                    })
+            clean_text, tool_calls = parse_tool_calls(ai_reply)
+            if tool_calls:
                 finish_reason = "tool_calls"
                 print(f"🔧 Tool calls detected: {[tc['function']['name'] for tc in tool_calls]}")
         
         msg = {"role": "assistant"}
         if tool_calls:
             msg["tool_calls"] = tool_calls
-            msg["content"] = None
+            msg["content"] = clean_text or None
         else:
-            msg["content"] = ai_reply
+            msg["content"] = clean_text
             
         return {
             "id": f"chatcmpl-{int(time.time())}",
@@ -1093,7 +1100,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 "total_tokens": len(conversation) + len(ai_reply)
             }
         }
-        
         
 if __name__ == "__main__":
     import uvicorn
