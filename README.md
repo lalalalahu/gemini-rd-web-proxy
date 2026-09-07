@@ -64,6 +64,7 @@ python run.py
 ```
 
 On first run:
+
 1. Chrome browser will open automatically
 2. Log in to your Google account
 3. Navigate to Gemini if not redirected automatically
@@ -166,6 +167,7 @@ python run.py
 ### OpenCode Configuration
 
 Make sure your OpenCode configuration matches exactly:
+
 - Provider name: `00bx-gemini`
 - Model name: `00bx-gemini-web`
 - Base URL: `http://localhost:8080/v1`
@@ -181,7 +183,7 @@ fallback; this works for clients that resend their complete message history.
 
 ## Project Structure
 
-```
+```text
 gemini-web-proxy/
 ├── server.py          # Main proxy server
 ├── run.py            # Startup script
@@ -194,7 +196,7 @@ gemini-web-proxy/
 
 ### Architecture
 
-```
+```text
 OpenCode → HTTP Request → Gemini Proxy → Browser Automation → Gemini Web
                                       ← Response Processing ←
 ```

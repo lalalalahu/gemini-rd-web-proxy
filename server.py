@@ -19,7 +19,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 # CONFIGURATION & CONSTANTS
 # ==============================================================================
 TARGET_URL = "https://gemini.rakyatdigital.gov.my"
-API_KEY = os.getenv("API_KEY", "nyewsp")  # Change this or set API_KEY env variable
+API_KEY = os.getenv("API_KEY", "api_key")  # Change this or set API_KEY env variable
 AVAILABLE_MODELS = ["Auto"]
 
 DATA_DIR = Path.home() / ".gemini-service"
