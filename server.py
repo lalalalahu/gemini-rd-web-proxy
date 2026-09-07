@@ -3,12 +3,13 @@ import re
 import time
 import json
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
 from playwright_stealth import Stealth
 
-from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi import FastAPI, HTTPException, Depends, Request, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -44,7 +45,24 @@ playwright_instance = None
 context: Optional[BrowserContext] = None
 session_pages: Dict[str, Page] = {}
 page_locks: Dict[str, asyncio.Lock] = {}
+session_creation_locks: Dict[str, asyncio.Lock] = {}
 is_ready = False
+
+# Gemini Enterprise often renders a short plan (for example, “I will search…”) before
+# it starts retrieval.  Those status messages are not a completed assistant response.
+INITIAL_RESPONSE_GRACE_SECONDS = float(os.getenv("INITIAL_RESPONSE_GRACE_SECONDS", "15"))
+INTERMEDIATE_STATUS_GRACE_SECONDS = float(os.getenv("INTERMEDIATE_STATUS_GRACE_SECONDS", "60"))
+FINAL_RESPONSE_QUIET_SECONDS = float(os.getenv("FINAL_RESPONSE_QUIET_SECONDS", "10"))
+
+INTERMEDIATE_STATUS_RE = re.compile(
+    r"^\s*(?:i(?:'ll| will)|let me)\s+(?:search|check|look(?:\s+up)?|retrieve|gather|analy[sz]e)\b",
+    re.IGNORECASE,
+)
+
+
+def is_intermediate_status(text: str) -> bool:
+    """True when Gemini has announced a tool/retrieval action, not an answer."""
+    return bool(INTERMEDIATE_STATUS_RE.match(text or ""))
 
 JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
     const stopButton = document.querySelector('.send-button.stop, md-icon-button.send-button.stop, [data-aria-label="Stop"], [aria-label="Stop"]');
@@ -54,19 +72,18 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
         if (icon.textContent.trim().toLowerCase() === 'stop') hasStopIcon = true;
     });
 
-    function getDeepText(node, inTable = false) {
+    function getDeepText(node) {
         if (!node) return '';
         let tag = '';
         if (node.nodeType === Node.ELEMENT_NODE) {
             const cls = (typeof node.className === 'string') ? node.className.toLowerCase() : '';
             tag = (node.tagName || '').toLowerCase();
             const role = node.getAttribute('role') || '';
-            const ariaLive = node.getAttribute('aria-live') || '';
 
-            // Blockers for UI noise
+            // Keep assistant text, but reject controls and retrieval UI noise.
             if (cls.includes('working-on-it-footer') || cls.includes('working-on-it-spark') || tag === 'ucs-lottie-animation') return '';
             if (['svg', 'details', 'button', 'menu', 'md-menu', 'img'].includes(tag) || tag.includes('button') || tag.includes('chip')) return '';
-            if (role === 'status' || ariaLive === 'polite' || role === 'progressbar') return '';
+            if (role === 'progressbar') return '';
             if (node.getAttribute('aria-hidden') === 'true' || cls.includes('sr-only')) return '';
 
             const isExcludedClass = [
@@ -77,89 +94,55 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
             if (isExcludedClass) return '';
         }
 
-        let prepend = '';
-        let append = '';
         const nl = String.fromCharCode(10);
-        let currentInTable = inTable;
-
-        // On-the-fly Markdown formatting
-        if (node.nodeType === Node.ELEMENT_NODE) {
-            if (['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)) {
-                append = nl + nl;
-            } else if (['br', 'div', 'li'].includes(tag)) {
-                if (!(tag === 'div' && currentInTable)) append = nl;
-            } else if (tag === 'table') {
-                currentInTable = true;
-                prepend = nl;
-                append = nl;
-            } else if (tag === 'tr') {
-                prepend = '| ';
-                append = nl;
-            } else if (['td', 'th'].includes(tag)) {
-                append = ' | ';
-            } else if (tag === 'strong' || tag === 'b') {
-                prepend = '**';
-                append = '**';
-            } else if (tag === 'code') {
-                prepend = '`';
-                append = '`';
-            } else if (tag === 'pre') {
-                prepend = nl + '```' + nl;
-                append = nl + '```' + nl;
-            }
-        }
-
-        let text = prepend;
         if (node.nodeType === Node.TEXT_NODE) {
-            const textVal = node.textContent || '';
-            if (textVal.trim().toLowerCase() === 'spark') return '';
-            if (currentInTable) {
-                text += textVal.replace(/\\n/g, ' ').replace(/\\s+/g, ' ');
-            } else {
-                text += textVal;
-            }
+            return (node.textContent || '').trim().toLowerCase() === 'spark' ? '' : (node.textContent || '');
         }
 
-        if (node.shadowRoot) text += getDeepText(node.shadowRoot, currentInTable);
+        if (tag === 'br') return nl;
+
+        let text = '';
+        if (node.shadowRoot) text += getDeepText(node.shadowRoot);
         if (node.childNodes) {
-            for (let child of node.childNodes) text += getDeepText(child, currentInTable);
+            for (let child of node.childNodes) text += getDeepText(child);
         }
 
-        // Table Header rendering
-        if (tag === 'tr') {
-             let cols = 0;
-             const countTh = (n) => {
-                 if(!n) return;
-                 if (n.nodeType === 1 && (n.tagName||'').toLowerCase() === 'th') cols++;
-                 if (n.shadowRoot) countTh(n.shadowRoot);
-                 if (n.childNodes) n.childNodes.forEach(countTh);
-             };
-             countTh(node);
-             if (cols > 0) append += '|' + '---|'.repeat(cols) + nl;
+        // Preserve all visible text without inventing Markdown.  In this
+        // corporate UI, PRE is also used as a layout wrapper, not only code.
+        if (tag === 'td' || tag === 'th') return text.trim() + ' | ';
+        if (tag === 'tr') return text.trim() + nl;
+        if (['p', 'div', 'li', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table'].includes(tag)) {
+            return text + nl;
         }
-
-        text += append;
         return text;
     }
 
-    // PERFECT TARGETING: Only grab text from the AI output blocks!
-    // This perfectly bypasses the user prompt and the tool activity timeline!
+    // Prefer the completed assistant summary.  Text streamers are a fallback
+    // because they may contain only the preliminary tool/retrieval message.
     let rawText = "";
-    const streamers = turnEl.querySelectorAll('ucs-text-streamer');
-    if (streamers && streamers.length > 0) {
+    const summary = turnEl.querySelector('ucs-summary, .summary, [data-message-author-role="assistant"]');
+    if (summary) {
+        rawText = getDeepText(summary);
+    } else {
+        const streamers = turnEl.querySelectorAll('ucs-text-streamer');
         streamers.forEach(s => {
             rawText += getDeepText(s) + String.fromCharCode(10);
         });
-    } else {
-        // Do not fall back to the entire turn: it also contains the user's
-        // prompt and the agent activity timeline.  A missing output container
-        // must produce no text rather than leak unrelated UI content.
-        const summary = turnEl.querySelector('ucs-summary, .summary');
-        if (summary) rawText = getDeepText(summary);
     }
+
+    // Enterprise search can keep working after the Stop button disappears.
+    // Detect its retrieval/progress UI separately from the answer extractor.
+    const hasBusyElement = Boolean(turnEl.querySelector(
+        '[aria-busy="true"], [role="progressbar"], ucs-lottie-animation'
+    ));
+    // Do not infer activity from visible words such as “Searching”.  This UI
+    // keeps completed search cards in the final transcript, which would make
+    // a text-based detector report “busy” forever.
+    const hasActiveWork = hasBusyElement;
 
     return {
         isGenerating: hasStop || hasStopIcon,
+        hasActiveWork,
         text: rawText,
         length: rawText.length
     };
@@ -203,6 +186,11 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.7
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Any] = None
+    # These are optional provider extensions.  `user` is part of the OpenAI
+    # request shape; the two explicit IDs support clients that expose them.
+    user: Optional[str] = None
+    conversation_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 # ==============================================================================
 # TOOL CALLING HELPERS
@@ -220,6 +208,36 @@ def get_content_text(content: Any) -> str:
             if isinstance(c, dict) and c.get("type") == "text"
         ])
     return ""
+
+
+def get_session_id(req: ChatRequest, request: Request) -> str:
+    """Return a stable, privacy-safe browser-page key for one client chat."""
+    candidates = [
+        req.session_id,
+        req.conversation_id,
+        req.user,
+        request.headers.get("x-session-id"),
+        request.headers.get("x-conversation-id"),
+        request.headers.get("x-opencode-session-id"),
+        request.headers.get("x-thread-id"),
+    ]
+    client_key = next((str(value).strip() for value in candidates if value and str(value).strip()), None)
+
+    if not client_key:
+        # Chat Completions has no required conversation ID.  Most clients send
+        # the transcript on every turn, so its first user message is a stable
+        # fallback that prevents unrelated new chats from sharing a browser tab.
+        first_user = next((message for message in req.messages if message.role == "user"), None)
+        client_key = get_content_text(first_user.content) if first_user else ""
+
+    if not client_key:
+        client_key = json.dumps(
+            [{"role": message.role, "content": get_content_text(message.content)} for message in req.messages],
+            sort_keys=True,
+        )
+
+    digest = hashlib.sha256(client_key.encode("utf-8")).hexdigest()[:24]
+    return f"chat-{digest}"
 
 def format_tools_prompt(tools: List[Tool]) -> str:
     """Format tools into a clear prompt for Gemini"""
@@ -586,7 +604,7 @@ async def init_browser():
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-extensions",
-            *headless_args
+            #*headless_args
         ],
         viewport={"width": 1280, "height": 900},
     )
@@ -644,49 +662,43 @@ async def init_browser():
     print("🎯 API: http://localhost:8080/v1/chat/completions\n")
 
 async def get_or_create_session_page(session_id: str = "default") -> Page:
-    global session_pages, page_locks
-    
-    if session_id not in session_pages:
+    """Get exactly one persistent Vertex page for each client conversation."""
+    global session_pages, page_locks, session_creation_locks
+
+    # Multiple requests for a new Hermes chat commonly arrive together (for
+    # example, streamed completion plus title generation).  Without this lock,
+    # both requests create separate Vertex pages for the same key.
+    creation_lock = session_creation_locks.setdefault(session_id, asyncio.Lock())
+    async with creation_lock:
+        page = session_pages.get(session_id)
+        if page and not page.is_closed():
+            return page
+
+        session_pages.pop(session_id, None)
+        page_locks.pop(session_id, None)
+
         print(f"  → New session: {session_id}", flush=True)
-        page = None
-        for p in context.pages:
-            if "gemini" in p.url or "rakyatdigital" in p.url:
-                page = p
-                break
-                
-        if not page:
-            page = await context.new_page()
-            
-            await Stealth().apply_stealth_async(page)
-            
-            await page.goto(TARGET_URL)
-            await asyncio.sleep(2)
-        else:
-            await page.bring_to_front()
-            
+        # Never borrow an arbitrary existing browser tab.  A new proxy session
+        # must start a new Vertex /r/session/... conversation.
+        page = await context.new_page()
+        await Stealth().apply_stealth_async(page)
+        await page.goto(TARGET_URL)
+        await asyncio.sleep(2)
+
         try:
             account_btn = await page.query_selector('div[data-identifier], .lCoei, [data-email], [data-authuser="0"]')
             if account_btn and "signin" in page.url:
                 print("  → Bypassing 'Choose an account' screen...", flush=True)
                 await account_btn.click()
                 await asyncio.sleep(3)
-        except:
-            pass
-            
+        except Exception as e:
+            print(f"  [Debug] Account chooser check failed: {e}", flush=True)
+
         await page.wait_for_selector('ucs-prosemirror-editor', timeout=15000)
         session_pages[session_id] = page
         page_locks[session_id] = asyncio.Lock()
         print(f"  ✓ Session {session_id} ready", flush=True)
-    else:
-        try:
-            _ = session_pages[session_id].url
-        except:
-            del session_pages[session_id]
-            if session_id in page_locks:
-                del page_locks[session_id]
-            return await get_or_create_session_page(session_id)
-            
-    return session_pages[session_id]
+        return page
 
 async def switch_model(page: Page, target_model: str):
     if not target_model or target_model.lower() == "gemini-enterprise":
@@ -774,12 +786,15 @@ async def send_to_gemini(page: Page, text: str, model: str = None, timeout: int 
     await asyncio.sleep(1)
 
     response_text = None
-    start_time = time.time()
-    previous_length = 0
-    stable_count = 0
+    start_time = time.monotonic()
+    previous_text = ""
+    first_content_at: Optional[float] = None
+    last_text_change_at: Optional[float] = None
+    last_active_work_at: Optional[float] = None
     has_seen_generation_start = False
-    
-    while (time.time() - start_time) < timeout:
+    has_seen_active_work = False
+
+    while (time.monotonic() - start_time) < timeout:
         try:
             response_divs = await page.query_selector_all('.turn')
             current_count = len(response_divs)
@@ -790,29 +805,48 @@ async def send_to_gemini(page: Page, text: str, model: str = None, timeout: int 
                 state = await last_turn.evaluate(JS_STATUS_AND_EXTRACTOR)
                 
                 is_generating = state.get("isGenerating", False)
-                has_working = state.get("hasWorkingOnIt", False)
-                current_text = state.get("text", "")
-                
-                content_only = clean_response_text(current_text)
-                current_len = len(content_only)
-                
-                if is_generating or current_len > 0:
+                has_active_work = state.get("hasActiveWork", False)
+                current_text = clean_response_text(state.get("text", ""))
+                now = time.monotonic()
+                text_changed = current_text != previous_text
+                previous_text = current_text
+
+                if current_text and first_content_at is None:
+                    first_content_at = now
+                if text_changed:
+                    last_text_change_at = now
+                if has_active_work:
+                    has_seen_active_work = True
+                    last_active_work_at = now
+
+                if current_text or is_generating or has_active_work:
                     has_seen_generation_start = True
-                
-                if has_seen_generation_start and not is_generating and not has_working and current_len > 0:
-                    if current_len == previous_length:
-                        stable_count += 1
-                        if stable_count >= 6:
-                            response_text = content_only
-                            break
-                    else:
-                        previous_length = current_len
-                        stable_count = 0
-                else:
-                    previous_length = current_len
-                    stable_count = 0
+
+                if (
+                    has_seen_generation_start
+                    and current_text
+                    and not is_generating
+                    and not has_active_work
+                    and first_content_at is not None
+                    and last_text_change_at is not None
+                ):
+                    grace_seconds = (
+                        INTERMEDIATE_STATUS_GRACE_SECONDS
+                        if is_intermediate_status(current_text) and not has_seen_active_work
+                        else INITIAL_RESPONSE_GRACE_SECONDS
+                    )
+                    quiet_since = max(
+                        last_text_change_at,
+                        last_active_work_at or last_text_change_at,
+                    )
+                    if (
+                        now - first_content_at >= grace_seconds
+                        and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
+                    ):
+                        response_text = current_text
+                        break
         except Exception as e:
-            pass
+            print(f"  [Debug] Error polling response: {e}", flush=True)
             
         await asyncio.sleep(0.5)
         
@@ -878,14 +912,16 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
             
         await asyncio.sleep(1)
 
-        start_time = time.time()
+        start_time = time.monotonic()
         previous_text = ""
-        emitted_text = ""
-        stable_count = 0
+        first_content_at: Optional[float] = None
+        last_text_change_at: Optional[float] = None
+        last_active_work_at: Optional[float] = None
+        last_keepalive_at = start_time
         has_seen_generation_start = False
-        stream_started = False
-        
-        while (time.time() - start_time) < timeout:
+        has_seen_active_work = False
+
+        while (time.monotonic() - start_time) < timeout:
             try:
                 response_divs = await page.query_selector_all('.turn')
                 current_count = len(response_divs)
@@ -895,50 +931,65 @@ async def stream_from_gemini(session_id: str, page: Page, text: str, model: str 
                     state = await last_turn.evaluate(JS_STATUS_AND_EXTRACTOR)
                     
                     is_generating = state.get("isGenerating", False)
+                    has_active_work = state.get("hasActiveWork", False)
                     current_text = clean_response_text(state.get("text", ""))
-
-                    # SSE deltas are append-only.  Never resend a rewritten DOM
-                    # snapshot: doing so duplicates text in OpenCode/Hermes.
+                    now = time.monotonic()
                     text_changed = current_text != previous_text
-                    new_chunk = ""
-                    if current_text.startswith(emitted_text):
-                        new_chunk = current_text[len(emitted_text):]
-                    elif current_text:
-                        # Gemini can replace its rendered DOM while formatting an
-                        # answer.  A streaming client cannot retract old tokens,
-                        # so wait for the next append-only snapshot instead.
-                        print("  [Debug] Ignoring rewritten response snapshot during stream", flush=True)
-
-                    if current_text:
-                        if not stream_started:
-                            # OpenCode-compatible streams begin with the assistant
-                            # role before sending content deltas.
-                            yield event({"role": "assistant", "content": ""})
-                            stream_started = True
-                        if new_chunk:
-                            yield event({"content": new_chunk})
-                            emitted_text = current_text
-
                     previous_text = current_text
 
-                    # Completion Check
-                    if len(current_text) > 0 or is_generating:
+                    if current_text and first_content_at is None:
+                        first_content_at = now
+                    if text_changed:
+                        last_text_change_at = now
+                    if has_active_work:
+                        has_seen_active_work = True
+                        last_active_work_at = now
+
+                    if current_text or is_generating or has_active_work:
                         has_seen_generation_start = True
-                    
-                    if is_generating or text_changed:
-                        stable_count = 0
-                    else:
-                        if has_seen_generation_start and len(current_text) > 0:
-                            stable_count += 1
-                            if stable_count >= 15:
-                                yield event({}, "stop")
-                                yield "data: [DONE]\n\n"
-                                break
+
+                    # Browser-rendered enterprise responses can replace the
+                    # provisional plan with the final answer.  Buffer the UI
+                    # snapshots and emit one complete OpenAI content delta only
+                    # after retrieval and rendering have both gone quiet.
+                    if (
+                        has_seen_generation_start
+                        and current_text
+                        and not is_generating
+                        and not has_active_work
+                        and first_content_at is not None
+                        and last_text_change_at is not None
+                    ):
+                        grace_seconds = (
+                            INTERMEDIATE_STATUS_GRACE_SECONDS
+                            if is_intermediate_status(current_text) and not has_seen_active_work
+                            else INITIAL_RESPONSE_GRACE_SECONDS
+                        )
+                        quiet_since = max(
+                            last_text_change_at,
+                            last_active_work_at or last_text_change_at,
+                        )
+                        if (
+                            now - first_content_at >= grace_seconds
+                            and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
+                        ):
+                            yield event({"role": "assistant", "content": ""})
+                            yield event({"content": current_text})
+                            yield event({}, "stop")
+                            yield "data: [DONE]\n\n"
+                            break
             except Exception as e:
                 # Do not hide streaming failures: swallowing them makes the
                 # client appear to hang and obscures the actual extractor issue.
                 print(f"  [Debug] Error polling stream: {e}", flush=True)
-                
+
+            # A standard SSE comment keeps the HTTP response alive while the
+            # enterprise UI is retrieving documents.  It is ignored by clients.
+            now = time.monotonic()
+            if now - last_keepalive_at >= 10:
+                yield ": keep-alive\n\n"
+                last_keepalive_at = now
+
             await asyncio.sleep(0.5)
 
 
@@ -965,16 +1016,20 @@ async def list_models():
     }
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
-async def chat_completions(req: ChatRequest):
+async def chat_completions(req: ChatRequest, request: Request):
     if not is_ready:
         raise HTTPException(status_code=503, detail="Gateway is initializing or awaiting authentication.")
         
-    session_id = "default"
+    session_id = get_session_id(req, request)
     page = await get_or_create_session_page(session_id)
     
     # Generate formatted conversation string combining tools and messages
     conversation = format_conversation(req.messages, req.tools)
-    print(f"📥 [{time.strftime('%H:%M:%S')}] User sending conversation with {len(req.messages)} msgs (Stream: {req.stream})...", flush=True)
+    print(
+        f"📥 [{time.strftime('%H:%M:%S')}] Chat {session_id[-8:]}: "
+        f"{len(req.messages)} msgs (Stream: {req.stream})...",
+        flush=True,
+    )
 
     # 1. STREAMING MODE (Prevents Hermes Timeout)
     if req.stream:

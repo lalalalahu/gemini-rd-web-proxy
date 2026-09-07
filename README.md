@@ -145,12 +145,39 @@ python run.py
 3. Verify your Google account has Gemini access
 4. Try restarting the proxy
 
+### Enterprise Retrieval Responses
+
+Gemini Enterprise / Vertex AI Search can render an interim plan such as “I will
+search…” before it retrieves documents and produces the final answer. The proxy
+buffers these UI snapshots and returns the final text as one OpenAI-compatible
+SSE content delta. It keeps the connection alive with SSE comments while it
+waits, so do not treat the first status line as a completion.
+
+The defaults are suitable for enterprise retrieval, but can be adjusted when a
+deployment is slower:
+
+```powershell
+$env:INITIAL_RESPONSE_GRACE_SECONDS = "15"
+$env:INTERMEDIATE_STATUS_GRACE_SECONDS = "60"
+$env:FINAL_RESPONSE_QUIET_SECONDS = "10"
+python run.py
+```
+
 ### OpenCode Configuration
 
 Make sure your OpenCode configuration matches exactly:
 - Provider name: `00bx-gemini`
 - Model name: `00bx-gemini-web`
 - Base URL: `http://localhost:8080/v1`
+
+### Conversation Isolation
+
+The OpenAI Chat Completions protocol does not require a conversation identifier.
+To guarantee that separate client chats use separate Vertex browser sessions, send
+one stable identifier for each conversation using `conversation_id`, `session_id`,
+the standard `user` field, or an `X-Session-ID` request header. When no identifier
+is provided, the proxy uses the first user message in the supplied transcript as a
+fallback; this works for clients that resend their complete message history.
 
 ## Project Structure
 
