@@ -4,6 +4,7 @@ import time
 import json
 import asyncio
 import hashlib
+import secrets
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 from dotenv import load_dotenv
@@ -532,7 +533,7 @@ async def init_browser():
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-extensions",
-            #*headless_args
+            *headless_args
         ],
         viewport={"width": 1280, "height": 900},
     )
