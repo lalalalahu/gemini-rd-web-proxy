@@ -48,6 +48,7 @@ is_ready = False
 
 JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
     const stopButton = document.querySelector('.send-button.stop, md-icon-button.send-button.stop, [data-aria-label="Stop"], [aria-label="Stop"]');
+    const hasStop = stopButton !== null;
     let hasStopIcon = false;
     document.querySelectorAll('.send-button md-icon, md-icon-button md-icon').forEach(icon => {
         if (icon.textContent.trim().toLowerCase() === 'stop') hasStopIcon = true;
